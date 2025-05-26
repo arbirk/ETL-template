@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
-    "runtime"
+
+	"github.com/schollz/progressbar/v3"
 )
 
 // StatusType defines the possible status values for steps and the overall pipeline.
@@ -392,26 +394,26 @@ func GetSpecificVersionedFilePath(stepName string, version int) (string, error) 
 // and returns a json.Encoder to write to it, along with a closer function, the version number, and the file path.
 // If stepName is empty, it uses the caller function's name as the step name.
 func GetNextVersionedJSONLWriter(stepName ...string) (encoder *json.Encoder, closer func() error, version int, filePath string, err error) {
-    var actualStepName string
-    if len(stepName) > 0 && stepName[0] != "" {
-        actualStepName = stepName[0]
-    } else {
-        actualStepName = getCallerFunctionName(2)
-    }
+	var actualStepName string
+	if len(stepName) > 0 && stepName[0] != "" {
+		actualStepName = stepName[0]
+	} else {
+		actualStepName = getCallerFunctionName(2)
+	}
 
-    filePath, version, err = GetNextVersionedFilePath(actualStepName)
-    if err != nil {
-        err = fmt.Errorf("getting next versioned .jsonl file path for %s/%s: %w", actualStepName, err)
-        return
-    }
+	filePath, version, err = GetNextVersionedFilePath(actualStepName)
+	if err != nil {
+		err = fmt.Errorf("getting next versioned .jsonl file path for %s: %w", actualStepName, err)
+		return
+	}
 
-    encoder, closer, err = NewJSONLWriter(filePath)
-    if err != nil {
-        err = fmt.Errorf("creating JSONL writer for %s (version %d): %w", filePath, version, err)
-        return
-    }
+	encoder, closer, err = NewJSONLWriter(filePath)
+	if err != nil {
+		err = fmt.Errorf("creating JSONL writer for %s (version %d): %w", filePath, version, err)
+		return
+	}
 
-    return encoder, closer, version, filePath, nil
+	return encoder, closer, version, filePath, nil
 }
 
 // SaveJSON marshals the given data to JSON and writes it to the specified file path.
@@ -640,44 +642,440 @@ func (pr *PipelineRun) Stow() {
 }
 
 func getCallerFunctionName(skip int) string {
-    // Skip GetCallerFunctionName and the function that called it (runtime.Caller)
-    // to get the actual caller of the function that *uses* getCallerFunctionName.
-    // pc, _, _, ok := runtime.Caller(2) // Skip 2 frames
-    // If getCallerFunctionName is called directly by the function we want to identify,
-    // then skip = 1 (for runtime.Caller itself) + 1 (for getCallerFunctionName) = 2.
-    // If getCallerFunctionName is called by an intermediate helper within the function we want to identify,
-    // you might need to adjust the skip count.
+	// Skip GetCallerFunctionName and the function that called it (runtime.Caller)
+	// to get the actual caller of the function that *uses* getCallerFunctionName.
+	// pc, _, _, ok := runtime.Caller(2) // Skip 2 frames
+	// If getCallerFunctionName is called directly by the function we want to identify,
+	// then skip = 1 (for runtime.Caller itself) + 1 (for getCallerFunctionName) = 2.
+	// If getCallerFunctionName is called by an intermediate helper within the function we want to identify,
+	// you might need to adjust the skip count.
 
-    // Let's assume the function that *uses* this utility is the one we want.
-    // So, if MyFunction calls thisUtility which calls getCallerFunctionName,
-    // and we want "MyFunction":
-    // runtime.Caller(0) -> runtime.Caller
-    // runtime.Caller(1) -> getCallerFunctionName
-    // runtime.Caller(2) -> thisUtility
-    // runtime.Caller(3) -> MyFunction
-    // So, if this is a direct utility, skip=2 is common.
+	// Let's assume the function that *uses* this utility is the one we want.
+	// So, if MyFunction calls thisUtility which calls getCallerFunctionName,
+	// and we want "MyFunction":
+	// runtime.Caller(0) -> runtime.Caller
+	// runtime.Caller(1) -> getCallerFunctionName
+	// runtime.Caller(2) -> thisUtility
+	// runtime.Caller(3) -> MyFunction
+	// So, if this is a direct utility, skip=2 is common.
 
-    pc, _, _, ok := runtime.Caller(skip) // Skip 1 frame (runtime.Caller itself) to get the immediate caller.
-                                      // If this function is a helper, and you want the caller of the helper,
-                                      // you'd use runtime.Caller(2).
-    if !ok {
-        return "unknown"
-    }
+	pc, _, _, ok := runtime.Caller(skip) // Skip 1 frame (runtime.Caller itself) to get the immediate caller.
+	// If this function is a helper, and you want the caller of the helper,
+	// you'd use runtime.Caller(2).
+	if !ok {
+		return "unknown"
+	}
 
-    fn := runtime.FuncForPC(pc)
-    if fn == nil {
-        return "unknown"
+	fn := runtime.FuncForPC(pc)
+	if fn == nil {
+		return "unknown"
+	}
+	// The name returned by fn.Name() is often fully qualified (e.g., "main.MyFunction" or "github.com/user/project/package.MyFunction")
+	// You might want to process it to get just the function name.
+	name := fn.Name()
+	// Example to get just the function part after the last dot.
+	if lastDot := strings.LastIndex(name, "."); lastDot != -1 {
+		name = name[lastDot+1:]
+	}
+	// Or after the last slash if it's a method on a type from another package
+	if lastSlash := strings.LastIndex(name, "/"); lastSlash != -1 && strings.Contains(name[lastSlash:], ".") {
+		// More complex parsing might be needed for package paths vs. method receivers
+	}
+	return name
+}
+
+// LoopState holds the progress of a loop processing records.
+type LoopState struct {
+	LastSuccessfullyProcessedIndex int `json:"lastSuccessfullyProcessedIndex"`
+	// Add other relevant state if needed, e.g., TotalRecords for consistency check
+}
+
+// GetLoopStateFilePath returns a standardized path for a loop's state file.
+func GetLoopStateFilePath(stepName string) (string, error) {
+	if stepName == "" {
+		return "", fmt.Errorf("stepName cannot be empty for loop state file path")
+	}
+	// Example: temp/MyLoopStep/loop_state.json
+	dir := filepath.Join(TempBaseDir, stepName)
+	if err := EnsureDir(dir); err != nil {
+		return "", fmt.Errorf("ensuring directory for loop state %s: %w", dir, err)
+	}
+	return filepath.Join(dir, "loop_state.json"), nil
+}
+
+// SaveLoopState saves the loop's current state to a JSON file.
+func SaveLoopState(stateFilePath string, state LoopState) error {
+	return SaveJSON(stateFilePath, state) // Uses existing SaveJSON
+}
+
+// LoadLoopState loads the loop's state from a JSON file.
+// Returns a zero-valued LoopState and no error if the file doesn't exist.
+func LoadLoopState(stateFilePath string) (LoopState, error) {
+	var state LoopState
+	state.LastSuccessfullyProcessedIndex = -1 // Default to indicate no records processed yet
+
+	_, err := os.Stat(stateFilePath)
+	if os.IsNotExist(err) {
+		return state, nil // File doesn't exist, start fresh
+	}
+	if err != nil {
+		return state, fmt.Errorf("stating loop state file %s: %w", stateFilePath, err)
+	}
+
+	err = ReadJSON(stateFilePath, &state) // Uses existing ReadJSON
+	if err != nil {
+		return state, fmt.Errorf("reading loop state file %s: %w", stateFilePath, err)
+	}
+	return state, nil
+}
+
+// CountLines counts non-empty lines in a file.
+func CountLines(filePath string) (int, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return 0, fmt.Errorf("opening file %s to count lines: %w", filePath, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	count := 0
+	for scanner.Scan() {
+		if len(strings.TrimSpace(scanner.Text())) > 0 { // Count non-empty lines
+			count++
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return count, fmt.Errorf("scanning file %s to count lines: %w", filePath, err)
+	}
+	return count, nil
+}
+
+// LoopProgressManager encapsulates progress bar logic.
+type LoopProgressManager struct {
+	bar          *progressbar.ProgressBar
+	totalRecords int
+}
+
+// NewLoopProgressManager creates and initializes a progress bar.
+func NewLoopProgressManager(totalRecords int, description string) *LoopProgressManager {
+	if totalRecords <= 0 { // No progress bar if no records or invalid count
+		return &LoopProgressManager{totalRecords: totalRecords}
+	}
+	bar := progressbar.NewOptions(totalRecords,
+		progressbar.OptionSetDescription(description),
+		progressbar.OptionSetPredictTime(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "[green]=[reset]",
+			SaucerHead:    "[green]>[reset]",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}))
+	return &LoopProgressManager{bar: bar, totalRecords: totalRecords}
+}
+
+// Set sets the progress bar to a specific count.
+func (lpm *LoopProgressManager) Set(count int) {
+	if lpm.bar != nil && count >= 0 {
+		lpm.bar.Set(count)
+	}
+}
+
+// Add increments the progress bar.
+func (lpm *LoopProgressManager) Add(n int) {
+	if lpm.bar != nil {
+		lpm.bar.Add(n)
+	}
+}
+
+// Describe updates the progress bar's description.
+func (lpm *LoopProgressManager) Describe(desc string) {
+	if lpm.bar != nil {
+		lpm.bar.Describe(desc)
+	}
+}
+
+// RenderBlank re-renders the bar, useful after printing other output.
+func (lpm *LoopProgressManager) RenderBlank() {
+	if lpm.bar != nil {
+		lpm.bar.RenderBlank()
+	}
+}
+
+// Finish closes/clears the progress bar.
+func (lpm *LoopProgressManager) Finish() {
+	if lpm.bar != nil {
+		// The bar might clear on finish based on options,
+		// but explicitly calling Finish is good practice.
+		lpm.bar.Finish() //nolint // We don't care about the error from Finish()
+	}
+}
+
+// RetryConfig holds parameters for retry logic.
+// For a zero-valued RetryConfig, MaxRetries will be 0 and Delay will be 0s,
+// effectively meaning no retries unless these fields are explicitly set to higher values.
+type RetryConfig struct {
+	MaxRetries int
+	Delay      time.Duration
+}
+
+// RecordTransformer defines a function that takes a raw record and returns a transformed record or an error.
+// The input `rawRecord` will be a pointer to the unmarshaled type (e.g., *UserData).
+// The output `transformedRecord` should be the transformed data (e.g., TransformedUserData or *TransformedUserData).
+type RecordTransformer func(rawRecord interface{}) (transformedRecord interface{}, err error)
+
+// RecordLoader defines a function that takes a transformed record and attempts to load it, returning an error.
+// The input `transformedRecord` will be whatever RecordTransformer returned.
+type RecordLoader func(transformedRecord interface{}) (err error)
+
+// ProcessStreamedRecords orchestrates the processing of records from an input file.
+// It handles state management for resuming, progress reporting, retries for transform and load operations,
+// and calls user-defined transformer and loader functions for each record.
+func ProcessStreamedRecords(
+	loopStepName string, // Name of the current loop step (for state management and logging)
+	inputFilePath string, // Full path to the input JSONL file
+	recordTemplate interface{}, // An empty struct of the type expected from the input JSONL (e.g., main.UserData{})
+	transformer RecordTransformer, // User-defined function to transform a raw record
+	loader RecordLoader, // User-defined function to load a transformed record
+	retryConfig ...RetryConfig, // Configuration for retries
+) error {
+	if retryConfig == nil || len(retryConfig) == 0 {
+        retryConfig = []RetryConfig{{MaxRetries: 0, Delay: 0 * time.Second}}
     }
-    // The name returned by fn.Name() is often fully qualified (e.g., "main.MyFunction" or "github.com/user/project/package.MyFunction")
-    // You might want to process it to get just the function name.
-    name := fn.Name()
-    // Example to get just the function part after the last dot.
-    if lastDot := strings.LastIndex(name, "."); lastDot != -1 {
-        name = name[lastDot+1:]
-    }
-    // Or after the last slash if it's a method on a type from another package
-    if lastSlash := strings.LastIndex(name, "/"); lastSlash != -1 && strings.Contains(name[lastSlash:], ".") {
-        // More complex parsing might be needed for package paths vs. method receivers
-    }
-    return name
+    
+    stateFilePath, err := GetLoopStateFilePath(loopStepName)
+	if err != nil {
+		return fmt.Errorf("%s: failed to get state file path: %w", loopStepName, err)
+	}
+	initialLoopState, err := LoadLoopState(stateFilePath)
+	if err != nil {
+		return fmt.Errorf("%s: failed to load loop state from %s: %w", loopStepName, stateFilePath, err)
+	}
+	fmt.Printf("%s: Resuming from index %d.\n", loopStepName, initialLoopState.LastSuccessfullyProcessedIndex)
+
+	totalRecords, err := CountLines(inputFilePath)
+	if err != nil {
+		return fmt.Errorf("%s: failed to count records in %s: %w", loopStepName, inputFilePath, err)
+	}
+	if totalRecords == 0 {
+		fmt.Printf("%s: No records to process in %s.\n", loopStepName, inputFilePath)
+		if initialLoopState.LastSuccessfullyProcessedIndex == -1 {
+			_ = CleanLoopStateFile(stateFilePath) // Best effort for empty file + fresh state
+		}
+		return nil
+	}
+
+	progressMgr := NewLoopProgressManager(totalRecords, fmt.Sprintf("%s: Processing Records", loopStepName))
+	defer progressMgr.Finish()
+
+	if initialLoopState.LastSuccessfullyProcessedIndex >= 0 {
+		// Ensure progress bar reflects already processed items
+		// Set expects the number of items completed.
+		progressMgr.Set(initialLoopState.LastSuccessfullyProcessedIndex + 1)
+	}
+
+	currentState := initialLoopState
+	currentRecordIndex := -1 // 0-based index for records
+	var processingErr error  // To store the error that causes the loop to stop
+
+	streamErr := StreamJSONLRecords(inputFilePath, recordTemplate, func(record interface{}) error {
+		currentRecordIndex++
+		progressMgr.Describe(fmt.Sprintf("Record %d/%d", currentRecordIndex+1, totalRecords))
+
+		if currentRecordIndex <= currentState.LastSuccessfullyProcessedIndex {
+			return nil // Skip already processed record
+		}
+
+		var transformedRecord interface{}
+		var terr, lerr error
+		var operationSuccessful bool
+
+		for attempt := 0; attempt <= retryConfig[0].MaxRetries; attempt++ {
+			operationSuccessful = false
+			if attempt > 0 {
+				fmt.Printf("\n%s: Retrying record index %d (attempt %d/%d) after %v delay...\n", loopStepName, currentRecordIndex, attempt, retryConfig[0].MaxRetries, retryConfig[0].Delay)
+				time.Sleep(retryConfig[0].Delay)
+				progressMgr.RenderBlank()
+			}
+
+			transformedRecord, terr = transformer(record)
+			if terr != nil {
+				fmt.Printf("\n%s: Transform error for record index %d: %v\n", loopStepName, currentRecordIndex, terr)
+				if attempt == retryConfig[0].MaxRetries {
+					processingErr = fmt.Errorf("%s: failed to transform record at index %d after %d retries: %w", loopStepName, currentRecordIndex, retryConfig[0].MaxRetries, terr)
+					return processingErr // Stop streaming
+				}
+				continue // Next attempt
+			}
+
+			lerr = loader(transformedRecord)
+			if lerr != nil {
+				fmt.Printf("\n%s: Load error for record index %d: %v\n", loopStepName, currentRecordIndex, lerr)
+				if attempt == retryConfig[0].MaxRetries {
+					processingErr = fmt.Errorf("%s: failed to load record at index %d after %d retries: %w", loopStepName, currentRecordIndex, retryConfig[0].MaxRetries, lerr)
+					return processingErr // Stop streaming
+				}
+				continue // Next attempt
+			}
+			operationSuccessful = true
+			break // Success
+		}
+
+		if !operationSuccessful {
+			if processingErr == nil { // Should be set by retry logic, but safeguard
+				processingErr = fmt.Errorf("%s: unknown error after retries for record index %d", loopStepName, currentRecordIndex)
+			}
+			return processingErr // Stop streaming
+		}
+
+		currentState.LastSuccessfullyProcessedIndex = currentRecordIndex
+		if err := SaveLoopState(stateFilePath, currentState); err != nil {
+			fmt.Fprintf(os.Stderr, "\n%s: CRITICAL - Failed to save loop state after processing record %d: %v\n", loopStepName, currentRecordIndex, err)
+			processingErr = fmt.Errorf("%s: CRITICAL - failed to save loop state: %w", loopStepName, err)
+			return processingErr // Stop streaming
+		}
+		progressMgr.Add(1)
+		return nil // Continue
+	})
+
+	// Handle errors from streaming or processing
+	if streamErr != nil {
+		// If processingErr was set inside the callback, streamErr will be that error.
+		// Otherwise, streamErr is an error from StreamJSONLRecords itself (e.g., file I/O).
+		if processingErr != nil {
+			// This means the error originated from our transform/load logic or state saving
+			fmt.Fprintf(os.Stderr, "\n%s: Finished with error after processing %d records: %v\n", loopStepName, currentState.LastSuccessfullyProcessedIndex+1, processingErr)
+			return processingErr
+		}
+		// This means an error occurred during the streaming process itself (e.g., reading file)
+		return fmt.Errorf("%s: error during record streaming from %s: %w", loopStepName, inputFilePath, streamErr)
+	}
+
+	// Post-loop actions
+	if currentState.LastSuccessfullyProcessedIndex == totalRecords-1 {
+		fmt.Printf("\n%s: All %d records processed successfully. Cleaning up state file.\n", loopStepName, totalRecords)
+		if err := CleanLoopStateFile(stateFilePath); err != nil {
+			fmt.Fprintf(os.Stderr, "\n%s: Warning - failed to remove state file %s: %v\n", loopStepName, stateFilePath, err)
+		}
+	} else if totalRecords > 0 { // Loop finished, but not all records processed (should have been an error)
+		fmt.Fprintf(os.Stderr, "\n%s: Finished. Last successfully processed index: %d out of %d total records. This indicates an unexpected state if no error was reported.\n", loopStepName, currentState.LastSuccessfullyProcessedIndex, totalRecords)
+	}
+
+	fmt.Printf("%s completed.\n", loopStepName)
+	return nil
+}
+
+// CleanLoopStateFile removes the loop state file.
+func CleanLoopStateFile(stateFilePath string) error {
+	err := os.Remove(stateFilePath)
+	if err != nil && !os.IsNotExist(err) { // Don't error if file already gone
+		return fmt.Errorf("failed to remove state file %s: %w", stateFilePath, err)
+	}
+	return nil
+}
+
+// ExecuteRecordProcessingLoop orchestrates the processing of records from a versioned input file.
+// It handles state management, progress reporting, retries, and calls user-defined
+// transformer and loader functions for each record.
+func ExecuteRecordProcessingLoop(
+	loopStepName string, // Name of the current loop step (for state management)
+	inputStepName string, // StepName of the step that produced the input file (e.g., "ExtractUsers")
+	recordTemplate interface{}, // An empty struct of the type expected from the input JSONL (e.g., main.UserData{})
+	transformer RecordTransformer, // User-defined function to transform a raw record
+	loader RecordLoader, // User-defined function to load a transformed record
+	defaultRetryConfig RetryConfig, // Default retry configuration
+) error {
+	inputFilePath, _, err := GetLatestVersionedFilePath(inputStepName)
+	if err != nil {
+		return fmt.Errorf("%s: failed to get latest output from %s: %w", loopStepName, inputStepName, err)
+	}
+	fmt.Printf("%s: Processing input file: %s\n", loopStepName, inputFilePath)
+
+	stateFilePath, err := GetLoopStateFilePath(loopStepName)
+	if err != nil {
+		return fmt.Errorf("%s: failed to get state file path: %w", loopStepName, err)
+	}
+	initialLoopState, err := LoadLoopState(stateFilePath)
+	if err != nil {
+		return fmt.Errorf("%s: failed to load loop state from %s: %w", loopStepName, stateFilePath, err)
+	}
+	fmt.Printf("%s: Resuming from index %d.\n", loopStepName, initialLoopState.LastSuccessfullyProcessedIndex)
+
+	totalRecords, err := CountLines(inputFilePath)
+	if err != nil {
+		return fmt.Errorf("%s: failed to count records in %s: %w", loopStepName, inputFilePath, err)
+	}
+	if totalRecords == 0 {
+		fmt.Printf("%s: No records to process.\n", loopStepName)
+		// Optionally clean up state file if it exists and indicates full processing of a previous empty file
+		if initialLoopState.LastSuccessfullyProcessedIndex == -1 { // No records processed, and file is empty
+			_ = CleanLoopStateFile(stateFilePath) // Best effort
+		}
+		return nil
+	}
+
+	progressMgr := NewLoopProgressManager(totalRecords, fmt.Sprintf("%s: Processing Records", loopStepName))
+	defer progressMgr.Finish()
+
+	if initialLoopState.LastSuccessfullyProcessedIndex >= 0 {
+		progressMgr.Set(initialLoopState.LastSuccessfullyProcessedIndex + 1)
+	}
+
+	processingErr := ProcessStreamedRecords(
+		loopStepName,
+		inputFilePath,
+		recordTemplate,
+		transformer,
+		loader,
+		defaultRetryConfig,
+	)
+
+	if processingErr != nil {
+		// ProcessStreamedRecords already prints detailed error messages for transform/load failures.
+		// This log focuses on the overall loop completion status.
+		fmt.Fprintf(os.Stderr, "\n%s: Finished with error after processing %d records: %v\n", loopStepName, initialLoopState.LastSuccessfullyProcessedIndex+1, processingErr)
+		return processingErr
+	}
+
+	// Check if all records were processed successfully
+	if initialLoopState.LastSuccessfullyProcessedIndex == totalRecords-1 {
+		fmt.Printf("\n%s: All %d records processed successfully. Cleaning up state file.\n", loopStepName, totalRecords)
+		if err := CleanLoopStateFile(stateFilePath); err != nil {
+			fmt.Fprintf(os.Stderr, "\n%s: Warning - failed to remove state file %s: %v\n", loopStepName, stateFilePath, err)
+		}
+	} else if totalRecords > 0 { // Loop finished, but not all records processed (should be caught by processingErr)
+		fmt.Fprintf(os.Stderr, "\n%s: Finished. Last successfully processed index: %d out of %d total records. This indicates an unexpected state if no error was reported.\n", loopStepName, initialLoopState.LastSuccessfullyProcessedIndex, totalRecords)
+	}
+
+	fmt.Printf("%s completed.\n", loopStepName)
+	return nil
+}
+
+func CreateTransformer[In, Out any](
+	transformLogic func(record In) (Out, error),
+) func(rawRecord interface{}) (interface{}, error) {
+	return func(rawRecord interface{}) (interface{}, error) {
+		typedRecord, ok := rawRecord.(In)
+		if !ok {
+			var zeroIn In
+			return nil, fmt.Errorf("transformer: unexpected type %T, expected %T", rawRecord, zeroIn)
+		}
+		return transformLogic(typedRecord)
+	}
+}
+
+func CreateLoader[In any](
+	loadLogic func(record In) error,
+) func(transformedRecord interface{}) error {
+	return func(transformedRecord interface{}) error {
+		typedRecord, ok := transformedRecord.(In)
+		if !ok {
+			var zeroIn In
+			return fmt.Errorf("loader: unexpected type %T, expected %T", transformedRecord, zeroIn)
+		}
+		return loadLogic(typedRecord)
+	}
 }
