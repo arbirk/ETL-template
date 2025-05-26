@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+    "runtime"
 )
 
 // StatusType defines the possible status values for steps and the overall pipeline.
@@ -308,11 +309,11 @@ func getNextVersionNumber(dirPath string) (int, error) {
 // Files are named "N.jsonl" (e.g., "1.jsonl", "2.jsonl").
 // Path structure: output/<flowType>/<stepName>/<versionNumber>.jsonl
 // It also returns the determined version number.
-func GetNextVersionedFilePath(flowType string, stepName string) (string, int, error) {
-	if flowType == "" || stepName == "" {
+func GetNextVersionedFilePath(stepName string) (string, int, error) {
+	if stepName == "" {
 		return "", 0, fmt.Errorf("flowType and stepName cannot be empty for versioned file path")
 	}
-	dir := filepath.Join(OutputBaseDir, flowType, stepName)
+	dir := filepath.Join(OutputBaseDir, stepName)
 	if err := EnsureDir(dir); err != nil {
 		return "", 0, err
 	}
@@ -330,11 +331,11 @@ func GetNextVersionedFilePath(flowType string, stepName string) (string, int, er
 // in the directory output/<flowType>/<stepName>/.
 // It returns the full file path and the version number.
 // Returns an error if no versioned files are found.
-func GetLatestVersionedFilePath(flowType string, stepName string) (string, int, error) {
-	if flowType == "" || stepName == "" {
+func GetLatestVersionedFilePath(stepName string) (string, int, error) {
+	if stepName == "" {
 		return "", 0, fmt.Errorf("flowType and stepName cannot be empty for latest versioned file path")
 	}
-	dir := filepath.Join(OutputBaseDir, flowType, stepName)
+	dir := filepath.Join(OutputBaseDir, stepName)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -372,14 +373,14 @@ func GetLatestVersionedFilePath(flowType string, stepName string) (string, int, 
 
 // GetSpecificVersionedFilePath returns the path for a specific versioned file.
 // Path structure: output/<flowType>/<stepName>/<versionNumber>.jsonl
-func GetSpecificVersionedFilePath(flowType string, stepName string, version int) (string, error) {
-	if flowType == "" || stepName == "" {
+func GetSpecificVersionedFilePath(stepName string, version int) (string, error) {
+	if stepName == "" {
 		return "", fmt.Errorf("flowType and stepName cannot be empty")
 	}
 	if version <= 0 {
 		return "", fmt.Errorf("version number must be positive")
 	}
-	dir := filepath.Join(OutputBaseDir, flowType, stepName)
+	dir := filepath.Join(OutputBaseDir, stepName)
 	filePath := filepath.Join(dir, fmt.Sprintf("%d.jsonl", version)) // Hardcoded .jsonl
 	return filePath, nil
 }
@@ -387,22 +388,30 @@ func GetSpecificVersionedFilePath(flowType string, stepName string, version int)
 // GetNextVersionedJSONLWriter gets the path for the next versioned .jsonl output file
 // and returns a json.Encoder to write to it, along with a closer function and the version number.
 // It handles errors from path generation and writer creation.
-func GetNextVersionedJSONLWriter(flowType string, stepName string) (encoder *json.Encoder, closer func() error, version int, filePath string, err error) {
-	filePath, version, err = GetNextVersionedFilePath(flowType, stepName)
-	if err != nil {
-		err = fmt.Errorf("getting next versioned .jsonl file path for %s/%s: %w", flowType, stepName, err)
-		return // Return all zero values for encoder, closer, version, and the error
-	}
+// GetNextVersionedJSONLWriter gets the path for the next versioned .jsonl output file
+// and returns a json.Encoder to write to it, along with a closer function, the version number, and the file path.
+// If stepName is empty, it uses the caller function's name as the step name.
+func GetNextVersionedJSONLWriter(stepName ...string) (encoder *json.Encoder, closer func() error, version int, filePath string, err error) {
+    var actualStepName string
+    if len(stepName) > 0 && stepName[0] != "" {
+        actualStepName = stepName[0]
+    } else {
+        actualStepName = getCallerFunctionName(2)
+    }
 
-	encoder, closer, err = NewJSONLWriter(filePath)
-	if err != nil {
-		err = fmt.Errorf("creating JSONL writer for %s (version %d): %w", filePath, version, err)
-		// filePath and version are valid here, but encoder and closer will be nil
-		return
-	}
+    filePath, version, err = GetNextVersionedFilePath(actualStepName)
+    if err != nil {
+        err = fmt.Errorf("getting next versioned .jsonl file path for %s/%s: %w", actualStepName, err)
+        return
+    }
 
-	// Success
-	return encoder, closer, version, filePath, nil
+    encoder, closer, err = NewJSONLWriter(filePath)
+    if err != nil {
+        err = fmt.Errorf("creating JSONL writer for %s (version %d): %w", filePath, version, err)
+        return
+    }
+
+    return encoder, closer, version, filePath, nil
 }
 
 // SaveJSON marshals the given data to JSON and writes it to the specified file path.
@@ -447,7 +456,7 @@ func ReadJSON(filePath string, target interface{}) error {
 // for a given flowType and stepName.
 // It unmarshals all records into the target slice.
 func ReadLatestVersionedJSONL(flowType string, stepName string, targetSlicePtr interface{}) (int, error) {
-	filePath, version, err := GetLatestVersionedFilePath(flowType, stepName)
+	filePath, version, err := GetLatestVersionedFilePath(stepName)
 	if err != nil {
 		return 0, fmt.Errorf("getting latest versioned .jsonl file path for %s/%s: %w", flowType, stepName, err)
 	}
@@ -463,7 +472,7 @@ func ReadLatestVersionedJSONL(flowType string, stepName string, targetSlicePtr i
 // for a given flowType, stepName, and version.
 // It unmarshals all records into the target slice.
 func ReadSpecificVersionedJSONL(flowType string, stepName string, version int, targetSlicePtr interface{}) error {
-	filePath, err := GetSpecificVersionedFilePath(flowType, stepName, version)
+	filePath, err := GetSpecificVersionedFilePath(stepName, version)
 	if err != nil {
 		return fmt.Errorf("getting specific versioned .jsonl file path for %s/%s v%d: %w", flowType, stepName, version, err)
 	}
@@ -628,4 +637,47 @@ func (pr *PipelineRun) Stow() {
 	if err := pr.SaveStatus(pr.StatusFilePath); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to save final successful status to %s: %v\n", pr.StatusFilePath, err)
 	}
+}
+
+func getCallerFunctionName(skip int) string {
+    // Skip GetCallerFunctionName and the function that called it (runtime.Caller)
+    // to get the actual caller of the function that *uses* getCallerFunctionName.
+    // pc, _, _, ok := runtime.Caller(2) // Skip 2 frames
+    // If getCallerFunctionName is called directly by the function we want to identify,
+    // then skip = 1 (for runtime.Caller itself) + 1 (for getCallerFunctionName) = 2.
+    // If getCallerFunctionName is called by an intermediate helper within the function we want to identify,
+    // you might need to adjust the skip count.
+
+    // Let's assume the function that *uses* this utility is the one we want.
+    // So, if MyFunction calls thisUtility which calls getCallerFunctionName,
+    // and we want "MyFunction":
+    // runtime.Caller(0) -> runtime.Caller
+    // runtime.Caller(1) -> getCallerFunctionName
+    // runtime.Caller(2) -> thisUtility
+    // runtime.Caller(3) -> MyFunction
+    // So, if this is a direct utility, skip=2 is common.
+
+    pc, _, _, ok := runtime.Caller(skip) // Skip 1 frame (runtime.Caller itself) to get the immediate caller.
+                                      // If this function is a helper, and you want the caller of the helper,
+                                      // you'd use runtime.Caller(2).
+    if !ok {
+        return "unknown"
+    }
+
+    fn := runtime.FuncForPC(pc)
+    if fn == nil {
+        return "unknown"
+    }
+    // The name returned by fn.Name() is often fully qualified (e.g., "main.MyFunction" or "github.com/user/project/package.MyFunction")
+    // You might want to process it to get just the function name.
+    name := fn.Name()
+    // Example to get just the function part after the last dot.
+    if lastDot := strings.LastIndex(name, "."); lastDot != -1 {
+        name = name[lastDot+1:]
+    }
+    // Or after the last slash if it's a method on a type from another package
+    if lastSlash := strings.LastIndex(name, "/"); lastSlash != -1 && strings.Contains(name[lastSlash:], ".") {
+        // More complex parsing might be needed for package paths vs. method receivers
+    }
+    return name
 }

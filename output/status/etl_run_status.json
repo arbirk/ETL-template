@@ -1,0 +1,13 @@
+{
+  "runId": "run_20250526_185354.498",
+  "startTime": "2025-05-26T18:53:54.498453265+02:00",
+  "overallStatus": "Completed",
+  "steps": [
+    {
+      "stepName": "ExtractUsers",
+      "status": "Completed",
+      "startTime": "2025-05-26T18:53:54.498534532+02:00",
+      "endTime": "2025-05-26T18:53:54.499324114+02:00"
+    }
+  ]
+}
